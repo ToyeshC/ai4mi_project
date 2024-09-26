@@ -36,6 +36,7 @@ import torch.nn.functional as F
 from torch import nn, Tensor
 from torchvision import transforms
 from torch.utils.data import DataLoader
+from torch.cuda.amp import GradScaler, autocast
 
 from dataset import SliceDataset
 from ShallowNet import shallowCNN
@@ -49,10 +50,6 @@ from utils import (Dcm,
                    save_images)
 
 from losses import (CrossEntropy)
-
-import torch.nn.utils as nn_utils
-
-import random
 
 
 datasets_params: dict[str, dict[str, Any]] = {}
@@ -77,7 +74,7 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
     optimizer = torch.optim.Adam(net.parameters(), lr=lr, betas=(0.9, 0.999))
 
     # Dataset part
-    B: int = datasets_params[args.dataset]['B']
+    B = datasets_params[args.dataset]['B']  # Define B here
     root_dir = Path("data") / args.dataset
 
     img_transform = transforms.Compose([
@@ -121,16 +118,12 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
 
     args.dest.mkdir(parents=True, exist_ok=True)
 
-    return (net, optimizer, device, train_loader, val_loader, K)
+    return (net, optimizer, device, train_loader, val_loader, K, B)  # Return B
 
 
 def runTraining(args):
+    net, optimizer, device, train_loader, val_loader, K, B = setup(args)  # Receive B here
     print(f">>> Setting up to train on {args.dataset} with {args.mode}")
-    net, optimizer, device, train_loader, val_loader, K = setup(args)
-
-    # Define batch size B here
-    B = datasets_params[args.dataset]['B']
-
     if args.mode == "full":
         loss_fn = CrossEntropy(idk=list(range(K)))  # Supervise both background and foreground
     elif args.mode in ["partial"] and args.dataset in ['SEGTHOR', 'SEGTHOR_STUDENTS']:
@@ -144,31 +137,33 @@ def runTraining(args):
     log_loss_val: Tensor = torch.zeros((args.epochs, len(val_loader)))
     log_dice_val: Tensor = torch.zeros((args.epochs, len(val_loader.dataset), K))
 
-    best_dice = 0.0
-    epochs_no_improve = 0
-    
-    for e in range(args.epochs):
-        for phase in ['train', 'val']:
-            if phase == 'train':
-                net.train()
-                opt = optimizer
-                cm = Dcm
-                desc = f">> Training   ({e: 4d})"
-                loader = train_loader
-                log_loss = log_loss_tra
-                log_dice = log_dice_tra
-            elif phase == 'val':
-                net.eval()
-                opt = None
-                cm = torch.no_grad
-                desc = f">> Validation ({e: 4d})"
-                loader = val_loader
-                log_loss = log_loss_val
-                log_dice = log_dice_val
+    best_dice: float = 0
 
-            with cm():
+    scaler = GradScaler()
+
+    for e in range(args.epochs):
+        for m in ['train', 'val']:
+            match m:
+                case 'train':
+                    net.train()
+                    opt = optimizer
+                    cm = Dcm
+                    desc = f">> Training   ({e: 4d})"
+                    loader = train_loader
+                    log_loss = log_loss_tra
+                    log_dice = log_dice_tra
+                case 'val':
+                    net.eval()
+                    opt = None
+                    cm = torch.no_grad
+                    desc = f">> Validation ({e: 4d})"
+                    loader = val_loader
+                    log_loss = log_loss_val
+                    log_dice = log_dice_val
+
+            with cm():  # Either dummy context manager, or the torch.no_grad for validation
+                j = 0
                 tq_iter = tqdm_(enumerate(loader), total=len(loader), desc=desc)
-                j = 0  # Initialize j here
                 for i, data in tq_iter:
                     img = data['images'].to(device)
                     gt = data['gts'].to(device)
@@ -176,114 +171,76 @@ def runTraining(args):
                     if opt:
                         opt.zero_grad()
 
-                    # Forward pass
-                    pred_logits = net(img)
-                    pred_probs = F.softmax(pred_logits, dim=1)
+                    with autocast():
+                        pred_logits = net(img)
+                        pred_probs = F.softmax(pred_logits, dim=1)
+                        pred_seg = probs2one_hot(pred_probs)
+                        loss = loss_fn(pred_probs, gt)
 
-                    # Metrics computation
-                    pred_seg = probs2one_hot(pred_probs)
                     log_dice[e, j:j + B, :] = dice_coef(gt, pred_seg)
-
-                    # Compute loss
-                    loss = loss_fn(pred_probs, gt)
                     log_loss[e, i] = loss.item()
 
                     if opt:
-                        loss.backward()
-                        
-                        # Apply gradient clipping
-                        nn_utils.clip_grad_norm_(net.parameters(), args.gradient_clip)
-                        
-                        opt.step()
+                        scaler.scale(loss).backward()
+                        scaler.step(opt)
+                        scaler.update()
 
-                    # Save predictions during validation
-                    if phase == 'val':
+                    if m == 'val':
                         with warnings.catch_warnings():
                             warnings.filterwarnings('ignore', category=UserWarning)
-                            predicted_class = probs2class(pred_probs)
-                            mult = 63 if K == 5 else (255 / (K - 1))
+                            predicted_class: Tensor = probs2class(pred_probs)
+                            mult: int = 63 if K == 5 else (255 / (K - 1))
                             save_images(predicted_class * mult,
                                         data['stems'],
-                                        args.dest / f"iter{e:03d}" / phase)
+                                        args.dest / f"iter{e:03d}" / m)
 
-                    # Update progress bar
-                    j += B
-                    postfix_dict = {"Dice": f"{log_dice[e, :j, 1:].mean():05.3f}",
-                                   "Loss": f"{log_loss[e, :i + 1].mean():5.2e}"}
+                    j += B  # Keep in mind that _in theory_, each batch might have a different size
+                    # For the DSC average: do not take the background class (0) into account:
+                    postfix_dict: dict[str, str] = {"Dice": f"{log_dice[e, :j, 1:].mean():05.3f}",
+                                                    "Loss": f"{log_loss[e, :i + 1].mean():5.2e}"}
                     if K > 2:
                         postfix_dict |= {f"Dice-{k}": f"{log_dice[e, :j, k].mean():05.3f}"
                                          for k in range(1, K)}
                     tq_iter.set_postfix(postfix_dict)
 
-        # Save metrics after each epoch
+        # I save it at each epochs, in case the code crashes or I decide to stop it early
         np.save(args.dest / "loss_tra.npy", log_loss_tra)
         np.save(args.dest / "dice_tra.npy", log_dice_tra)
         np.save(args.dest / "loss_val.npy", log_loss_val)
         np.save(args.dest / "dice_val.npy", log_dice_val)
 
-        # Check for improvement
-        current_dice = log_dice_val[e, :, 1:].mean().item()
+        current_dice: float = log_dice_val[e, :, 1:].mean().item()
         if current_dice > best_dice:
             print(f">>> Improved dice at epoch {e}: {best_dice:05.3f}->{current_dice:05.3f} DSC")
             best_dice = current_dice
             with open(args.dest / "best_epoch.txt", 'w') as f:
-                f.write(str(e))
+                    f.write(str(e))
 
             best_folder = args.dest / "best_epoch"
             if best_folder.exists():
-                rmtree(best_folder)
+                    rmtree(best_folder)
             copytree(args.dest / f"iter{e:03d}", Path(best_folder))
 
             torch.save(net, args.dest / "bestmodel.pkl")
             torch.save(net.state_dict(), args.dest / "bestweights.pt")
 
-            # Reset early stopping counter
-            epochs_no_improve = 0
-        else:
-            epochs_no_improve += 1
-            print(f"{epochs_no_improve} epochs with no improvement.")
 
-            if epochs_no_improve >= args.patience:
-                print(f"Early stopping triggered after {e} epochs.")
-                break  # Exit the training loop
+def main():
+    parser = argparse.ArgumentParser()
 
-    print("Training complete.")
-
-
-def get_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description='Training Parameters')
-
-    # Existing arguments...
     parser.add_argument('--epochs', default=200, type=int)
     parser.add_argument('--dataset', default='TOY2', choices=datasets_params.keys())
     parser.add_argument('--mode', default='full', choices=['partial', 'full'])
     parser.add_argument('--dest', type=Path, required=True,
                         help="Destination directory to save the results (predictions and weights).")
+
     parser.add_argument('--num_workers', type=int, default=5)
     parser.add_argument('--gpu', action='store_true')
     parser.add_argument('--debug', action='store_true',
                         help="Keep only a fraction (10 samples) of the datasets, "
                              "to test the logic around epochs and logging easily.")
-    
-    # New arguments for early stopping and gradient clipping
-    parser.add_argument('--patience', type=int, default=10,
-                        help="Number of epochs with no improvement after which training will be stopped.")
-    parser.add_argument('--gradient_clip', type=float, default=1.0,
-                        help="Maximum norm for gradient clipping.")
-    
-    # Add the seed argument
-    parser.add_argument('--seed', type=int, default=0, help="Random seed for reproducibility")
-    
+
     args = parser.parse_args()
-    random.seed(args.seed)
-
-    print(args)
-
-    return args
-
-
-def main():
-    args = get_args()
 
     pprint(args)
 
@@ -292,4 +249,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
