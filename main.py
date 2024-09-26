@@ -39,7 +39,7 @@ from torch.utils.data import DataLoader
 
 from dataset import SliceDataset
 from ShallowNet import shallowCNN
-from ENet import ENet
+from UNet import UNet  # Changed from ENet to UNet
 from utils import (Dcm,
                    class2one_hot,
                    probs2one_hot,
@@ -55,7 +55,7 @@ datasets_params: dict[str, dict[str, Any]] = {}
 # K for the number of classes
 # Avoids the clases with C (often used for the number of Channel)
 datasets_params["TOY2"] = {'K': 2, 'net': shallowCNN, 'B': 2}
-datasets_params["SEGTHOR"] = {'K': 5, 'net': ENet, 'B': 8}
+datasets_params["SEGTHOR"] = {'K': 5, 'net': UNet, 'B': 8}  # Changed ENet to UNet
 
 
 def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
@@ -65,7 +65,7 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
     print(f">> Picked {device} to run experiments")
 
     K: int = datasets_params[args.dataset]['K']
-    net = datasets_params[args.dataset]['net'](1, K)
+    net = datasets_params[args.dataset]['net'](in_channels=1, out_channels=K)  # Updated parameters if necessary
     net.init_weights()
     net.to(device)
 
