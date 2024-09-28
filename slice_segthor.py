@@ -35,8 +35,7 @@ import numpy as np
 import nibabel as nib
 from skimage.io import imsave
 from skimage.transform import resize
-from scipy.ndimage import shift as nd_shift
-from scipy.ndimage import center_of_mass
+
 from utils import map_, tqdm_
 
 
@@ -73,8 +72,7 @@ def sanity_gt(gt, ct) -> bool:
     assert gt.dtype in [np.uint8], gt.dtype
 
     # Do the test on 3d: assume all organs are present..
-    # Commented out because it might fail if some organs are missing
-    # assert set(np.unique(gt)) == set(range(5))
+    assert set(np.unique(gt)) == set(range(5))
 
     return True
 
@@ -82,50 +80,14 @@ def sanity_gt(gt, ct) -> bool:
 resize_: Callable = partial(resize, mode="constant", preserve_range=True, anti_aliasing=False)
 
 
-def compute_shift(gt1: np.ndarray, gt2: np.ndarray) -> tuple[float, float, float]:
-    """Compute the shift between two ground truth volumes."""
-    com1 = center_of_mass(gt1 > 0)
-    com2 = center_of_mass(gt2 > 0)
-    # Compute the shift as the difference between com2 and com1
-    shift = (com2[0] - com1[0], com2[1] - com1[1], com2[2] - com1[2])
-    return shift
-
-
-def compute_shift_for_patient(id_: str, source_path: Path) -> tuple[float, float, float]:
-    """Compute the shift for patient 27."""
-    id_path: Path = source_path / 'train' / id_
-
-    gt_path: Path = id_path / "GT2.nii.gz" # correct
-    gt_nib = nib.load(str(gt_path))
-    gt = np.asarray(gt_nib.dataobj)
-
-    gt_shifted_path: Path = id_path / "GT.nii.gz" # shifted
-    gt_shifted_nib = nib.load(str(gt_shifted_path))
-    gt_shifted = np.asarray(gt_shifted_nib.dataobj)
-
-    # Compute the shift
-    shift = compute_shift(gt, gt_shifted)
-
-    # Print the centers of mass for patient 27
-    com1 = center_of_mass(gt > 0)
-    com2 = center_of_mass(gt_shifted > 0)
-    print(f"Patient {id_}: GT COM original: {com1}")
-    print(f"Patient {id_}: GT COM shifted: {com2}")
-    print(f"Computed shift between GT and GT_shifted for patient {id_}: {shift}")
-
-    return shift
-
-
 def slice_patient(id_: str, dest_path: Path, source_path: Path, shape: tuple[int, int],
-                  test_mode: bool = False, shift: tuple[float, float, float] = None) -> tuple[float, float, float]:
-    if test_mode:
-        id_path: Path = source_path / 'test' / id_
-    else:
-        id_path: Path = source_path / 'train' / id_
+                  test_mode: bool = False) -> tuple[float, float, float]:
+    id_path: Path = source_path / ("train" if not test_mode else "test") / id_
 
-    ct_path: Path = id_path / f"{id_}.nii.gz"
+    ct_path: Path = (id_path / f"{id_}.nii.gz") if not test_mode else (source_path / "test" / f"{id_}.nii.gz")
     nib_obj = nib.load(str(ct_path))
     ct: np.ndarray = np.asarray(nib_obj.dataobj)
+    # dx, dy, dz = nib_obj.header.get_zooms()
     x, y, z = ct.shape
     dx, dy, dz = nib_obj.header.get_zooms()
 
@@ -135,27 +97,11 @@ def slice_patient(id_: str, dest_path: Path, source_path: Path, shape: tuple[int
     if not test_mode:
         gt_path: Path = id_path / "GT.nii.gz"
         gt_nib = nib.load(str(gt_path))
+        # print(nib_obj.affine, gt_nib.affine)
         gt = np.asarray(gt_nib.dataobj)
         assert sanity_gt(gt, ct)
     else:
         gt = np.zeros_like(ct, dtype=np.uint8)
-
-    # Compute center of mass before shift
-    ct_com_before = center_of_mass(ct)
-    gt_com_before = center_of_mass(gt > 0)
-
-    if shift is not None and id_ != 'Patient_27':
-        ct = nd_shift(ct, shift, order=1, mode='constant', cval=0.0)
-        gt = nd_shift(gt, shift, order=0, mode='constant', cval=0)
-        gt = gt.astype(np.uint8)
-
-    # Compute center of mass after shift
-    ct_com_after = center_of_mass(ct)
-    gt_com_after = center_of_mass(gt > 0)
-
-    # Print the centers of mass before and after shift
-    print(f"Patient {id_}: CT COM before shift: {ct_com_before}, after shift: {ct_com_after}")
-    print(f"Patient {id_}: GT COM before shift: {gt_com_before}, after shift: {gt_com_after}")
 
     norm_ct: np.ndarray = norm_arr(ct)
 
@@ -168,13 +114,15 @@ def slice_patient(id_: str, dest_path: Path, source_path: Path, shape: tuple[int
         assert img_slice.shape == gt_slice.shape
         gt_slice *= 63
         assert gt_slice.dtype == np.uint8, gt_slice.dtype
+        # assert set(np.unique(gt_slice)) <= set(range(5))
         assert set(np.unique(gt_slice)) <= set([0, 63, 126, 189, 252]), np.unique(gt_slice)
 
         arrays: list[np.ndarray] = [img_slice, gt_slice]
 
         subfolders: list[str] = ["img", "gt"]
         assert len(arrays) == len(subfolders)
-        for save_subfolder, data in zip(subfolders, arrays):
+        for save_subfolder, data in zip(subfolders,
+                                        arrays):
             filename = f"{id_}_{idz:04d}.png"
 
             save_path: Path = Path(dest_path, save_subfolder)
@@ -189,7 +137,7 @@ def slice_patient(id_: str, dest_path: Path, source_path: Path, shape: tuple[int
 
 def get_splits(src_path: Path, retains: int, fold: int) -> tuple[list[str], list[str], list[str]]:
     ids: list[str] = sorted(map_(lambda p: p.name, (src_path / 'train').glob('*')))
-    print(f"Found {len(ids)} patients in the training set")
+    print(f"Founds {len(ids)} in the id list")
     print(ids[:10])
     assert len(ids) > retains
 
@@ -201,8 +149,8 @@ def get_splits(src_path: Path, retains: int, fold: int) -> tuple[list[str], list
     training_ids: list[str] = [e for e in ids if e not in validation_ids]
     assert (len(training_ids) + len(validation_ids)) == len(ids)
 
-    test_ids: list[str] = sorted(map_(lambda p: p.name, (src_path / 'test').glob('*')))
-    print(f"Found {len(test_ids)} test patients")
+    test_ids: list[str] = sorted(map_(lambda p: Path(p.stem).stem, (src_path / 'test').glob('*')))
+    print(f"Founds {len(test_ids)} test ids")
     print(test_ids[:10])
 
     return training_ids, validation_ids, test_ids
@@ -223,45 +171,32 @@ def main(args: argparse.Namespace):
 
     resolution_dict: dict[str, tuple[float, float, float]] = {}
 
-    # First, compute the shift using patient 27
-    shift = compute_shift_for_patient('Patient_27', src_path)
-    print(f"Computed shift: {shift}")
-
-    # Process patient 27 separately
-    for mode, split_ids in zip(["train", "val", "test"], [training_ids, validation_ids, test_ids]):
-        if 'Patient_27' in split_ids:
-            dest_mode: Path = dest_path / mode
-            dx, dy, dz = slice_patient('Patient_27', dest_mode, src_path, tuple(args.shape), test_mode=(mode == 'test'))
-            resolution_dict['Patient_27'] = (dx, dy, dz)
-            split_ids.remove('Patient_27')
-            break
-
-    # Then, process other patients, applying the shift
+    split_ids: list[str]
     for mode, split_ids in zip(["train", "val", "test"], [training_ids, validation_ids, test_ids]):
         dest_mode: Path = dest_path / mode
-        print(f"Slicing {len(split_ids)} patients to {dest_mode}")
+        print(f"Slicing {len(split_ids)} pairs to {dest_mode}")
 
         pfun: Callable = partial(slice_patient,
                                  dest_path=dest_mode,
                                  source_path=src_path,
                                  shape=tuple(args.shape),
-                                 test_mode=mode == 'test',
-                                 shift=shift)
+                                 test_mode=mode == 'test')
         resolutions: list[tuple[float, float, float]]
         iterator = tqdm_(split_ids)
-        if args.process == 1:
-            resolutions = list(map(pfun, iterator))
-        elif args.process == -1:
-            resolutions = Pool().map(pfun, iterator)
-        else:
-            resolutions = Pool(args.process).map(pfun, iterator)
+        match args.process:
+            case 1:
+                resolutions = list(map(pfun, iterator))
+            case -1:
+                resolutions = Pool().map(pfun, iterator)
+            case _ as p:
+                resolutions = Pool(p).map(pfun, iterator)
 
         for key, val in zip(split_ids, resolutions):
             resolution_dict[key] = val
 
     with open(dest_path / "spacing.pkl", 'wb') as f:
         pickle.dump(resolution_dict, f, pickle.HIGHEST_PROTOCOL)
-        print(f"Saved spacing dictionary to {f}")
+        print(f"Saved spacing dictionnary to {f}")
 
 
 def get_args() -> argparse.Namespace:
