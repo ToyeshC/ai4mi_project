@@ -25,7 +25,7 @@ def calculate_correction_matrix():
     return correction_matrix
 
 def compute_heart_shift(original_gt, corrected_gt):
-    # heart
+    # Heart label is assumed to be '2'
     heart_original = (original_gt == 2).astype(np.float32)
     heart_corrected = (corrected_gt == 2).astype(np.float32)
 
@@ -35,8 +35,7 @@ def compute_heart_shift(original_gt, corrected_gt):
 
     return shift_vector
 
-def apply_correction(image_data, correction_matrix):
-
+def apply_correction(image_data, correction_matrix, order=1):
     # Decompose correction_matrix into linear part and translation
     M = correction_matrix[:3, :3]
     t = correction_matrix[:3, 3]
@@ -52,15 +51,17 @@ def apply_correction(image_data, correction_matrix):
         image_data,
         M_inv,
         offset=offset,
-        order=1,      # Linear interpolation
+        order=order,
         mode='constant',
         cval=0.0
     )
 
+    # Cast to original data type
+    corrected_data = corrected_data.astype(image_data.dtype)
     return corrected_data
 
 def shift_heart_segment(gt_data, shift_vector):
-    # heart
+    # Heart label is assumed to be '2'
     heart_segment = (gt_data == 2).astype(np.float32)
 
     shifted_heart = shift(
@@ -71,10 +72,11 @@ def shift_heart_segment(gt_data, shift_vector):
         cval=0.0
     )
 
-    gt_data_corrected = np.where(gt_data == 2, 0, gt_data) # Remove
-    gt_data_corrected = np.where(shifted_heart > 0, 2, gt_data_corrected) # Add shifted
+    gt_data_corrected = np.where(gt_data == 2, 0, gt_data)  # Remove original heart label
+    gt_data_corrected = np.where(shifted_heart > 0, 2, gt_data_corrected)  # Add shifted heart label
 
-    return gt_data_corrected
+    # Cast to uint8
+    return gt_data_corrected.astype(np.uint8)
 
 def process_patient(patient_folder, correction_matrix, heart_shift_vector, output_folder):
     patient_output_folder = output_folder / patient_folder.name
@@ -83,26 +85,28 @@ def process_patient(patient_folder, correction_matrix, heart_shift_vector, outpu
     # Process CT image
     ct_path = patient_folder / f"{patient_folder.name}.nii.gz"
     ct_data, ct_affine = load_nifti(ct_path)
-    corrected_ct = apply_correction(ct_data, correction_matrix)
-    save_nifti(patient_output_folder / f"{patient_folder.name}_corrected.nii.gz", corrected_ct, ct_affine)
+    corrected_ct = apply_correction(ct_data, correction_matrix, order=1)
+    corrected_ct = np.round(corrected_ct).astype(ct_data.dtype)
+    save_nifti(patient_output_folder / f"{patient_folder.name}.nii.gz", corrected_ct, ct_affine)
 
     # Process GT segmentation
     gt_path = patient_folder / "GT.nii.gz"
     gt_data, gt_affine = load_nifti(gt_path)
-    corrected_gt = apply_correction(gt_data, correction_matrix)
-
-    # Shift the heart segment
+    corrected_gt = apply_correction(gt_data, correction_matrix, order=0)
     corrected_gt = shift_heart_segment(corrected_gt, heart_shift_vector)
 
-    save_nifti(patient_output_folder / "GT_corrected.nii.gz", corrected_gt, gt_affine)
+    # Ensure labels are within valid range
+    corrected_gt = np.clip(corrected_gt, 0, 4)
+    save_nifti(patient_output_folder / "GT.nii.gz", corrected_gt, gt_affine)
 
 def main():
     data_root = Path("/home/dev/ai4mi_project/data/segthor_train/train")
-    output_root = Path("/home/dev/ai4mi_project/data/segthor_train_corrected")
+    output_root = Path("/home/dev/ai4mi_project/data/segthor_train_corrected/train")
     patient_27_folder = data_root / "Patient_27"
 
     output_root.mkdir(parents=True, exist_ok=True)
 
+    # Load original and corrected GT for Patient 27
     original_gt, _ = load_nifti(patient_27_folder / "GT.nii.gz")
     corrected_gt, _ = load_nifti(patient_27_folder / "GT2.nii.gz")
 

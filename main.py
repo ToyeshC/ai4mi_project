@@ -35,6 +35,10 @@ import numpy as np
 import torch.nn.functional as F
 from torch import nn, Tensor
 from torchvision import transforms
+from torchvision.transforms import (RandomHorizontalFlip,
+                                    RandomVerticalFlip,
+                                    RandomAffine, 
+                                    ColorJitter)
 from torch.utils.data import DataLoader
 
 from dataset import SliceDataset
@@ -48,7 +52,7 @@ from utils import (Dcm,
                    dice_coef,
                    save_images)
 
-from losses import (CrossEntropy)
+from losses import (HybridLoss, CrossEntropy)
 
 
 datasets_params: dict[str, dict[str, Any]] = {}
@@ -78,6 +82,10 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
 
     img_transform = transforms.Compose([
         lambda img: img.convert('L'),
+        RandomHorizontalFlip(p=0.5),  # 50% chance of horizontal flip
+        RandomVerticalFlip(p=0.5),    # 50% chance of vertical flip
+        RandomAffine(degrees=15, translate=(0.1, 0.1), scale=(0.9, 1.1)),  # Rotation, translation, and scaling
+        # ColorJitter(brightness=0.2, contrast=0.2),  # Adjust brightness and contrast
         lambda img: np.array(img)[np.newaxis, ...],
         lambda nd: nd / 255,  # max <= 1
         lambda nd: torch.tensor(nd, dtype=torch.float32)
@@ -89,6 +97,7 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
         # {0, 85, 170, 255} for 4 classes
         # {0, 51, 102, 153, 204, 255} for 6 classes
         # Very sketchy but that works here and that simplifies visualization
+        RandomAffine(degrees=15, translate=(0.1, 0.1), scale=(0.9, 1.1), interpolation=0),  # No interpolation for labels
         lambda nd: nd / (255 / (K - 1)) if K != 5 else nd / 63,  # max <= 1
         lambda nd: torch.tensor(nd, dtype=torch.int64)[None, ...],  # Add one dimension to simulate batch
         lambda t: class2one_hot(t, K=K),
