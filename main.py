@@ -36,6 +36,7 @@ import torch.nn.functional as F
 from torch import nn, Tensor
 from torchvision import transforms
 from torch.utils.data import DataLoader
+from torch.cuda.amp import autocast, GradScaler
 
 from dataset import SliceDataset
 from ShallowNet import shallowCNN
@@ -55,24 +56,28 @@ from NoNewNet import NoNewNet
 
 datasets_params: dict[str, dict[str, Any]] = {}
 # K for the number of classes
-# Avoids the clases with C (often used for the number of Channel)
+# Avoids the classes with C (often used for the number of Channel)
 datasets_params["TOY2"] = {'K': 2, 'net': shallowCNN, 'B': 2}
-datasets_params["SEGTHOR"] = {'K': 5, 'net': NoNewNet, 'B': 8}  # Adjust 'K' (number of classes) and 'B' (batch size) as needed
+datasets_params["SEGTHOR"] = {'K': 5, 'net': NoNewNet, 'B': 16}  # Increased batch size from 8 to 16
 
 
-def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
+def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int, GradScaler]:
     # Networks and scheduler
     gpu: bool = args.gpu and torch.cuda.is_available()
     device = torch.device("cuda") if gpu else torch.device("cpu")
     print(f">> Picked {device} to run experiments")
 
     K: int = datasets_params[args.dataset]['K']
-    net = datasets_params[args.dataset]['net'](in_channels=1, out_channels=K)
+    net = datasets_params[args.dataset]['net'](in_channels=1, out_channels=K)  # Initialize the selected network
     net.init_weights()
     net.to(device)
 
-    lr = 0.0005
-    optimizer = torch.optim.Adam(net.parameters(), lr=lr, betas=(0.9, 0.999))
+    # Define an appropriate learning rate
+    base_lr = 0.0005
+    batch_size = datasets_params[args.dataset]['B']
+    scaled_lr = base_lr * (batch_size / 8)  # Assuming 8 was the original batch size
+
+    optimizer = torch.optim.Adam(net.parameters(), lr=scaled_lr, betas=(0.9, 0.999))
 
     # Dataset part
     B: int = datasets_params[args.dataset]['B']
@@ -119,12 +124,15 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
 
     args.dest.mkdir(parents=True, exist_ok=True)
 
-    return (net, optimizer, device, train_loader, val_loader, K)
+    # Initialize GradScaler for mixed precision
+    scaler = GradScaler()
+
+    return (net, optimizer, device, train_loader, val_loader, K, scaler)
 
 
 def runTraining(args):
     print(f">>> Setting up to train on {args.dataset} with {args.mode}")
-    net, optimizer, device, train_loader, val_loader, K = setup(args)
+    net, optimizer, device, train_loader, val_loader, K, scaler = setup(args)
 
     if args.mode == "full":
         loss_fn = CrossEntropy(idk=list(range(K)))  # Supervise both background and foreground
@@ -161,33 +169,34 @@ def runTraining(args):
                     log_loss = log_loss_val
                     log_dice = log_dice_val
 
-            with cm():  # Either dummy context manager, or the torch.no_grad for validation
+            with cm():
                 j = 0
                 tq_iter = tqdm_(enumerate(loader), total=len(loader), desc=desc)
                 for i, data in tq_iter:
                     img = data['images'].to(device)
                     gt = data['gts'].to(device)
 
-                    if opt:  # So only for training
+                    if opt:
                         opt.zero_grad()
 
-                    # Sanity tests to see we loaded and encoded the data correctly
                     assert 0 <= img.min() and img.max() <= 1
                     B, _, W, H = img.shape
 
-                    pred_logits = net(img)
-                    pred_probs = F.softmax(1 * pred_logits, dim=1)  # 1 is the temperature parameter
+                    with autocast():  # Enable mixed precision for forward pass
+                        pred_logits = net(img)
+                        pred_probs = F.softmax(1 * pred_logits, dim=1)
+                        loss = loss_fn(pred_probs, gt)
+
+                    if opt:
+                        scaler.scale(loss).backward()
+                        scaler.step(opt)
+                        scaler.update()
 
                     # Metrics computation, not used for training
                     pred_seg = probs2one_hot(pred_probs)
-                    log_dice[e, j:j + B, :] = dice_coef(gt, pred_seg)  # One DSC value per sample and per class
+                    log_dice[e, j:j + B, :] = dice_coef(gt, pred_seg)
 
-                    loss = loss_fn(pred_probs, gt)
-                    log_loss[e, i] = loss.item()  # One loss value per batch (averaged in the loss)
-
-                    if opt:  # Only for training
-                        loss.backward()
-                        opt.step()
+                    log_loss[e, i] = loss.item()
 
                     if m == 'val':
                         with warnings.catch_warnings():
@@ -198,8 +207,7 @@ def runTraining(args):
                                         data['stems'],
                                         args.dest / f"iter{e:03d}" / m)
 
-                    j += B  # Keep in mind that _in theory_, each batch might have a different size
-                    # For the DSC average: do not take the background class (0) into account:
+                    j += B
                     postfix_dict: dict[str, str] = {"Dice": f"{log_dice[e, :j, 1:].mean():05.3f}",
                                                     "Loss": f"{log_loss[e, :i + 1].mean():5.2e}"}
                     if K > 2:
@@ -207,7 +215,7 @@ def runTraining(args):
                                          for k in range(1, K)}
                     tq_iter.set_postfix(postfix_dict)
 
-        # I save it at each epochs, in case the code crashes or I decide to stop it early
+        # Save training logs
         np.save(args.dest / "loss_tra.npy", log_loss_tra)
         np.save(args.dest / "dice_tra.npy", log_dice_tra)
         np.save(args.dest / "loss_val.npy", log_loss_val)
@@ -218,11 +226,11 @@ def runTraining(args):
             print(f">>> Improved dice at epoch {e}: {best_dice:05.3f}->{current_dice:05.3f} DSC")
             best_dice = current_dice
             with open(args.dest / "best_epoch.txt", 'w') as f:
-                    f.write(str(e))
+                f.write(str(e))
 
             best_folder = args.dest / "best_epoch"
             if best_folder.exists():
-                    rmtree(best_folder)
+                rmtree(best_folder)
             copytree(args.dest / f"iter{e:03d}", Path(best_folder))
 
             torch.save(net, args.dest / "bestmodel.pkl")
@@ -253,4 +261,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-    
