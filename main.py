@@ -36,11 +36,11 @@ import torch.nn.functional as F
 from torch import nn, Tensor
 from torchvision import transforms
 from torch.utils.data import DataLoader
-from torch.cuda.amp import autocast, GradScaler
+from torch.cuda.amp import GradScaler, autocast
 
 from dataset import SliceDataset
 from ShallowNet import shallowCNN
-
+from ENet import ENet
 from utils import (Dcm,
                    class2one_hot,
                    probs2one_hot,
@@ -58,7 +58,7 @@ datasets_params: dict[str, dict[str, Any]] = {}
 # K for the number of classes
 # Avoids the classes with C (often used for the number of Channel)
 datasets_params["TOY2"] = {'K': 2, 'net': shallowCNN, 'B': 2}
-datasets_params["SEGTHOR"] = {'K': 5, 'net': NoNewNet, 'B': 16}  # Increased batch size from 8 to 16
+datasets_params["SEGTHOR"] = {'K': 5, 'net': ENet, 'B': 8}
 
 
 def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int, GradScaler]:
@@ -68,7 +68,7 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int, GradS
     print(f">> Picked {device} to run experiments")
 
     K: int = datasets_params[args.dataset]['K']
-    net = datasets_params[args.dataset]['net'](in_channels=1, out_channels=K)  # Initialize the selected network
+    net = datasets_params[args.dataset]['net'](1, K)
     net.init_weights()
     net.to(device)
 
@@ -80,7 +80,7 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int, GradS
     optimizer = torch.optim.Adam(net.parameters(), lr=scaled_lr, betas=(0.9, 0.999))
 
     # Dataset part
-    B: int = datasets_params[args.dataset]['B']
+    B = datasets_params[args.dataset]['B']  # Define B here
     root_dir = Path("data") / args.dataset
 
     img_transform = transforms.Compose([
@@ -124,16 +124,12 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int, GradS
 
     args.dest.mkdir(parents=True, exist_ok=True)
 
-    # Initialize GradScaler for mixed precision
-    scaler = GradScaler()
-
-    return (net, optimizer, device, train_loader, val_loader, K, scaler)
+    return (net, optimizer, device, train_loader, val_loader, K, B)  # Return B
 
 
 def runTraining(args):
+    net, optimizer, device, train_loader, val_loader, K, B = setup(args)  # Receive B here
     print(f">>> Setting up to train on {args.dataset} with {args.mode}")
-    net, optimizer, device, train_loader, val_loader, K, scaler = setup(args)
-
     if args.mode == "full":
         loss_fn = CrossEntropy(idk=list(range(K)))  # Supervise both background and foreground
     elif args.mode in ["partial"] and args.dataset in ['SEGTHOR', 'SEGTHOR_STUDENTS']:
@@ -148,6 +144,8 @@ def runTraining(args):
     log_dice_val: Tensor = torch.zeros((args.epochs, len(val_loader.dataset), K))
 
     best_dice: float = 0
+
+    scaler = GradScaler()
 
     for e in range(args.epochs):
         for m in ['train', 'val']:
@@ -179,24 +177,19 @@ def runTraining(args):
                     if opt:
                         opt.zero_grad()
 
-                    assert 0 <= img.min() and img.max() <= 1
-                    B, _, W, H = img.shape
-
-                    with autocast():  # Enable mixed precision for forward pass
+                    with autocast():
                         pred_logits = net(img)
-                        pred_probs = F.softmax(1 * pred_logits, dim=1)
+                        pred_probs = F.softmax(pred_logits, dim=1)
+                        pred_seg = probs2one_hot(pred_probs)
                         loss = loss_fn(pred_probs, gt)
+
+                    log_dice[e, j:j + B, :] = dice_coef(gt, pred_seg)
+                    log_loss[e, i] = loss.item()
 
                     if opt:
                         scaler.scale(loss).backward()
                         scaler.step(opt)
                         scaler.update()
-
-                    # Metrics computation, not used for training
-                    pred_seg = probs2one_hot(pred_probs)
-                    log_dice[e, j:j + B, :] = dice_coef(gt, pred_seg)
-
-                    log_loss[e, i] = loss.item()
 
                     if m == 'val':
                         with warnings.catch_warnings():
