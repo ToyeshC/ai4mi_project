@@ -27,12 +27,14 @@ from functools import partial
 from multiprocessing import Pool
 from contextlib import AbstractContextManager
 from typing import Callable, Iterable, List, Set, Tuple, TypeVar, cast
+from scipy.spatial.distance import directed_hausdorff
 
 import torch
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
 from torch import Tensor, einsum
+import nibabel as nib
 
 tqdm_ = partial(tqdm, dynamic_ncols=True,
                 leave=True,
@@ -176,3 +178,32 @@ def union(a: Tensor, b: Tensor) -> Tensor:
     assert sset(res, [0, 1])
 
     return res
+
+
+def compute_affine_transformation(original_nifti_path, corrected_nifti_path):
+    """
+    Compute the affine transformation matrix between the original and corrected NIfTI files.
+    """
+    original_nifti = nib.load(original_nifti_path)
+    corrected_nifti = nib.load(corrected_nifti_path)
+
+    original_affine = original_nifti.affine
+    corrected_affine = corrected_nifti.affine
+
+    transformation_matrix = np.linalg.inv(original_affine) @ corrected_affine
+
+    return transformation_matrix
+
+
+def hausdorff_distance(a: np.ndarray, b: np.ndarray) -> float:
+    """
+    Compute the Hausdorff distance
+    """
+    a_points = np.argwhere(a)
+    b_points = np.argwhere(b)
+
+    if len(a_points) == 0 or len(b_points) == 0:
+        return 0.0  # Return 0 if either mask is empty
+
+    return max(directed_hausdorff(a_points, b_points)[0],
+               directed_hausdorff(b_points, a_points)[0])
